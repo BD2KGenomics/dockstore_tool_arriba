@@ -1,0 +1,167 @@
+#!/bin/bash
+
+print_usage(){
+>&2 cat <<EOF
+
+$0 -a <genome.fa> -b <hg38|hg19> -g <annotation gtf> -k <known fusions list> -s <star index directory> -o <outputdir> -T <threads> -f <read1.fastq.gz> -r <read2.fastq.gz>
+
+OPTIONS:
+   -u	Show this message
+   -a	Genome fasta file (may be gzipped)
+   -b   Genome version, either hg38 or hg19. This is used for identification of the correct blacklist
+   -g	Annotation for genome in gtf format (may be gzipped)
+   -k	Known fusions list. See http://arriba.readthedocs.io/en/latest/input-files/#known-fusions
+   -o	Output directory (will be created), default .
+   -s	Directory containing STAR index files (may be in tar.gz format)
+   -T	Number of threads to use for run, default 2
+   -f   Forward reads in gzipped fastq format
+   -r	Reverse reads
+
+EOF
+}
+
+STAR_INDEX='False'
+ANNOTATION_GTF='False'
+ASSEMBLY_FA='False'
+GENOME_VERSION='False'
+KNOWN_FUSIONS='False'
+OUTDIR='.'
+READ1='False'
+READ2='False'
+THREADS='2'
+while getopts "a:b:g:k:o:s:T:f:r:u" OPTION
+do
+    case "${OPTION}"
+    in
+    a) ASSEMBLY_FA=${OPTARG};;
+    b) GENOME_VERSION=$OPTARG;;
+    g) ANNOTATION_GTF=${OPTARG};;
+    k) KNOWN_FUSIONS=${OPTARG};;
+    o) OUTDIR=${OPTARG};;
+    s) STAR_INDEX=${OPTARG};;
+    f) READ1=${OPTARG};;
+    r) READ2=${OPTARG};;
+    T) THREADS=${OPTARG};;
+    u) print_usage;
+             exit;;
+    *) print_usage;
+             exit;;
+    esac
+done
+
+# Check if all file arguments have been given and are valid
+file_check() {
+    if [ $1 == 'False' ]; then
+        print_usage
+        echo "ERROR: some input arguments are missing"
+        exit
+    fi
+    if [[ ! -e "$1" ]]; then
+        print_usage
+        echo "ERROR: can't find $1"
+        exit
+    fi
+}
+# if necessary untar, unzip, etc, and return the new filename
+file_uncompress(){
+    case "$1" in
+        *.tar.bz2|*.tar.gz|*.tar.xz|*.tbz2|*.tgz|*.txz|*.tar) 
+               tar xvf "$1" 
+               ls -t | head -n 1 ;;
+        *.gz)  newfile=$(echo $1 | sed 's/.*\///' | sed 's/\.gz$//')
+               gunzip -c "$1" > $newfile
+               echo $newfile     ;;
+        *)     echo $1           ;;
+    esac
+}
+
+for i in $ANNOTATION_GTF $ASSEMBLY_FA $KNOWN_FUSIONS $STAR_INDEX $READ1 $READ2; do
+	file_check $i
+done
+
+echo "Uncompressing..."
+ANNOTATION_GTF=$(file_uncompress $ANNOTATION_GTF)
+ASSEMBLY_FA=$(file_uncompress $ASSEMBLY_FA)
+KNOWN_FUSIONS=$(file_uncompress $KNOWN_FUSIONS)
+STAR_INDEX=$(file_uncompress $STAR_INDEX)
+# make sure we have the correct subdirectory for STAR
+STAR_INDEX_DIR=$(find $STAR_INDEX -type f -name SA | sed 's/\/SA//' | head -n 1)
+
+# installation directory of arriba
+BASE_DIR='/opt/arriba_v0.12.0'
+
+# get blacklist
+case $GENOME_VERSION
+    in
+    hg38) BLACKLIST_TSV="$BASE_DIR/database/blacklist_hg38_GRCh38_2018-01-13.tsv.gz"
+	;;
+    hg19) BLACKLIST_TSV="$BASE_DIR/database/blacklist_hg19_hs37d5_GRCh37_2018-01-13.tsv"
+	;;
+    *) echo "ERROR: invalid genome version, please choose from hg38 or hg19"
+       exit
+	;;
+esac
+
+mkdir -p $OUTDIR
+
+# align FastQ files (STAR >=2.5.3a recommended)
+# "--outSAMtype BAM Unsorted SortedByCoordinate" generates both, an unsorted and a coordinate-sorted output file
+# the former is directly piped to extract_read-through_fusions via "--outStd BAM_Unsorted"
+# like so, read-through fusions are extracted while the alignment is running, instead of after
+
+starcmd="STAR \
+	--runThreadN $THREADS \
+	--genomeDir $STAR_INDEX_DIR --genomeLoad NoSharedMemory \
+	--readFilesIn $READ1 $READ2 --readFilesCommand zcat \
+	--outStd BAM_Unsorted --outSAMtype BAM Unsorted SortedByCoordinate \
+	--outSAMunmapped Within \
+	--outFilterMultimapNmax 1 --outFilterMismatchNmax 3 --outFilterMismatchNoverLmax 0.3 \
+	--alignIntronMax 500000 --alignMatesGapMax 500000 \
+	--chimSegmentMin 10 --chimJunctionOverhangMin 10 --chimScoreMin 1 --chimScoreDropMax 30 \
+        --chimScoreJunctionNonGTAG 0 --chimScoreSeparation 1 --alignSJstitchMismatchNmax 5 -1 5 5 \
+        --chimSegmentReadGapMax 3 --chimMainSegmentMultNmax 10 \
+	--limitBAMsortRAM 31532137230 | \
+  $BASE_DIR/extract_read-through_fusions -g $ANNOTATION_GTF | samtools sort - read_through"
+echo "Running $starcmd"
+eval $starcmd
+
+echo "indexing bam files..."
+# index normal alignments
+samtools index Aligned.sortedByCoord.out.bam &
+
+# index read-through fusions
+samtools index read_through.bam
+
+echo "sorting and indexing chimeric bam file..."
+# convert chimeric SAM to BAM and sort
+samtools view -Sbu Chimeric.out.sam | samtools sort - chimeric
+rm -f Chimeric.out.sam
+samtools index chimeric.bam
+
+wait # for indexing of normal alignments
+
+# call arriba
+arrcmd="$BASE_DIR/arriba \
+	-c chimeric.bam \
+	-r read_through.bam \
+	-x Aligned.sortedByCoord.out.bam \
+	-o $OUTDIR/fusions.tsv \
+	-a $ASSEMBLY_FA \
+	-g $ANNOTATION_GTF \
+	-b $BLACKLIST_TSV \
+	-T $THREADS \
+        -k $KNOWN_FUSIONS "
+#	-O $OUTDIR/fusions.discarded.tsv \
+#	-d structural_variants_from_WGS.tsv \
+echo "Running $arrcmd"
+eval $arrcmd
+
+echo "Done! Cleaning up."
+exit
+rm -rf $OUTDIR/STAR
+for i in Aligned.sortedByCoord.out.bam chimeric.bam.bai Log.out read_through.bam \
+Aligned.sortedByCoord.out.bam.bai Chimeric.out.junction Log.progress.out read_through.bam.bai \
+chimeric.bam Chimeric.out.sam Log.final.out Log.std.out SJ.out.tab; do
+    rm $i
+done
+
