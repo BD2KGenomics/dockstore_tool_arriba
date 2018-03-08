@@ -16,7 +16,7 @@ doc: |
 requirements:
   - class: InlineJavascriptRequirement
   - class: DockerRequirement
-    dockerPull: "quay.io/ucsc_cgl/arriba:0.12.0"
+    dockerPull: "quay.io/ucsc_cgl/dockstore_tool_arriba:0.12.0"
 
 baseCommand: ["run_arriba"]
 
@@ -74,4 +74,5 @@ outputs:
     type: File
     outputBinding:
        glob: $(inputs.outputdir + '/fusions.tsv')
+
 
